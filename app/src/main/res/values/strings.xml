@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Volume Keys</string>
+    <string name="service_desc">يستخدم أزرار الصوت للتحكم في الموسيقى والشاشة مقفولة</string>
+</resources>
