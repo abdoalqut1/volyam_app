@@ -11,9 +11,6 @@ import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
-import android.media.VolumeProvider
-import android.media.session.MediaSession
-import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -26,7 +23,7 @@ class VolumeKeyService : AccessibilityService() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val doubleTapMs = 350L          // غيّر الرقم ده لو عايز السرعة تتغير
-    private val comboWindowMs = 150L        // نافذة ضغط الزرارين مع بعض والشاشة مطفية
+    private val comboWindowMs = 200L        // نافذة ضغط الزرارين مع بعض والشاشة مطفية
 
     private var upDown = false
     private var downDown = false
@@ -37,8 +34,12 @@ class VolumeKeyService : AccessibilityService() {
     private var lastKeyEventTimeMs = 0L
     private var isForegroundRunning = false
 
-    private var mediaSession: MediaSession? = null
-    private var volumeProvider: VolumeProvider? = null
+    // متغيرات مراقبة تغيير الصوت والشاشة سوداء تمامًا
+    private var volumeDrivenPending = false
+    private var baselineVol = -1
+    private var intendedSingleVol = -1
+    private var ignoredTargetVol = -1
+    private var ignoreVolumeUntilMs = 0L
 
     private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
     private val power by lazy { getSystemService(POWER_SERVICE) as PowerManager }
@@ -50,18 +51,28 @@ class VolumeKeyService : AccessibilityService() {
 
     private val flushRunnable = Runnable { flushSingle() }
     private val stopKeepAliveRunnable = Runnable { stopKeepAlive() }
-    private val reclaimSessionRunnable = Runnable {
-        if (!power.isInteractive && isForegroundRunning) {
-            mediaSession?.isActive = false
-            mediaSession?.isActive = true
-        }
-    }
 
-    private val screenReceiver = object : BroadcastReceiver() {
+    private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                Intent.ACTION_SCREEN_OFF -> updateActiveState(screenOffHint = true)
-                Intent.ACTION_SCREEN_ON -> updateActiveState(screenOffHint = false)
+                Intent.ACTION_SCREEN_OFF -> {
+                    ensureVolumeHeadroom()
+                    updateActiveState(screenOffHint = true)
+                }
+                Intent.ACTION_SCREEN_ON -> {
+                    cancelPending()
+                    updateActiveState(screenOffHint = false)
+                }
+                VOLUME_CHANGED_ACTION -> {
+                    val streamType = intent.getIntExtra(EXTRA_VOLUME_STREAM_TYPE, -1)
+                    if (streamType == AudioManager.STREAM_MUSIC) {
+                        val newVol = intent.getIntExtra(EXTRA_VOLUME_STREAM_VALUE, -1)
+                        val oldVol = intent.getIntExtra(EXTRA_PREV_VOLUME_STREAM_VALUE, -1)
+                        if (newVol >= 0 && oldVol >= 0) {
+                            handleVolumeChanged(oldVol, newVol)
+                        }
+                    }
+                }
             }
         }
     }
@@ -77,15 +88,15 @@ class VolumeKeyService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         createNotificationChannel()
-        initMediaSession()
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
+            addAction(VOLUME_CHANGED_ACTION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(screenReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            registerReceiver(systemReceiver, filter, Context.RECEIVER_EXPORTED)
         } else {
-            registerReceiver(screenReceiver, filter)
+            registerReceiver(systemReceiver, filter)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && playbackCallback != null) {
             audio.registerAudioPlaybackCallback(playbackCallback, handler)
@@ -93,30 +104,68 @@ class VolumeKeyService : AccessibilityService() {
         updateActiveState()
     }
 
-    private fun initMediaSession() {
-        volumeProvider = object : VolumeProvider(VOLUME_CONTROL_RELATIVE, 100, 50) {
-            override fun onAdjustVolume(direction: Int) {
-                if (power.isInteractive) return
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastKeyEventTimeMs < 80L) return
+    private fun ensureVolumeHeadroom() {
+        if (!audio.isMusicActive) return
+        val maxVol = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val curVol = audio.getStreamVolume(AudioManager.STREAM_MUSIC)
+        if (curVol >= maxVol && maxVol > 1) {
+            setMusicVolumeSilently(maxVol - 1)
+        }
+    }
 
-                val code = when (direction) {
-                    AudioManager.ADJUST_RAISE -> KeyEvent.KEYCODE_VOLUME_UP
-                    AudioManager.ADJUST_LOWER -> KeyEvent.KEYCODE_VOLUME_DOWN
-                    else -> return
-                }
-                handler.post { registerTap(code, allowOppositeCombo = true) }
+    private fun setMusicVolumeSilently(targetVol: Int) {
+        ignoredTargetVol = targetVol
+        ignoreVolumeUntilMs = SystemClock.elapsedRealtime() + 180L
+        try {
+            audio.setStreamVolume(AudioManager.STREAM_MUSIC, targetVol, 0)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun handleVolumeChanged(oldVol: Int, newVol: Int) {
+        if (power.isInteractive) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastKeyEventTimeMs < 150L) return
+        if (now <= ignoreVolumeUntilMs && newVol == ignoredTargetVol) return
+        if (newVol == oldVol) return
+
+        val code = if (newVol > oldVol) KeyEvent.KEYCODE_VOLUME_UP else KeyEvent.KEYCODE_VOLUME_DOWN
+
+        if (pendingCode != 0 && pendingCode != code) {
+            if (volumeDrivenPending && (now - pendingTimeMs) <= comboWindowMs) {
+                val restore = baselineVol
+                cancelPending()
+                if (restore >= 0) setMusicVolumeSilently(restore)
+                sendMedia(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
+                updateActiveState(screenOffHint = true, forceAudioActive = true)
+                return
             }
+            flushSingle()
         }
 
-        mediaSession = MediaSession(this, "VolumeKeysSession").apply {
-            setFlags(0)
-            val state = PlaybackState.Builder()
-                .setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1.0f)
-                .build()
-            setPlaybackState(state)
-            volumeProvider?.let { setPlaybackToRemote(it) }
-            isActive = false
+        if (pendingCount == 0) {
+            baselineVol = oldVol
+            intendedSingleVol = newVol
+            pendingCode = code
+            pendingCount = 1
+            pendingTimeMs = now
+            volumeDrivenPending = true
+
+            val maxVol = audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            if (code == KeyEvent.KEYCODE_VOLUME_UP && newVol >= maxVol && maxVol > 1) {
+                setMusicVolumeSilently(maxVol - 1)
+            } else if (code == KeyEvent.KEYCODE_VOLUME_DOWN && newVol <= 0 && maxVol > 1) {
+                setMusicVolumeSilently(1)
+            }
+
+            handler.removeCallbacks(flushRunnable)
+            handler.postDelayed(flushRunnable, doubleTapMs)
+        } else {
+            val restore = baselineVol
+            cancelPending()
+            if (restore >= 0) setMusicVolumeSilently(restore)
+            if (code == KeyEvent.KEYCODE_VOLUME_UP) sendMedia(KeyEvent.KEYCODE_MEDIA_NEXT)
+            else sendMedia(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
         }
     }
 
@@ -127,7 +176,6 @@ class VolumeKeyService : AccessibilityService() {
         val isScreenOff = screenOffHint ?: !power.isInteractive
         if (!isScreenOff) {
             handler.removeCallbacks(stopKeepAliveRunnable)
-            handler.removeCallbacks(reclaimSessionRunnable)
             stopKeepAlive()
             return
         }
@@ -145,9 +193,6 @@ class VolumeKeyService : AccessibilityService() {
     private fun startKeepAlive() {
         if (!wakeLock.isHeld) {
             wakeLock.acquire(4 * 60 * 60 * 1000L)
-        }
-        if (mediaSession?.isActive == false) {
-            mediaSession?.isActive = true
         }
         if (!isForegroundRunning) {
             try {
@@ -168,10 +213,6 @@ class VolumeKeyService : AccessibilityService() {
     }
 
     private fun stopKeepAlive() {
-        handler.removeCallbacks(reclaimSessionRunnable)
-        if (mediaSession?.isActive == true) {
-            mediaSession?.isActive = false
-        }
         if (isForegroundRunning) {
             try {
                 stopForeground(STOP_FOREGROUND_REMOVE)
@@ -237,31 +278,23 @@ class VolumeKeyService : AccessibilityService() {
                 if (!upDown && !downDown) comboFired = false
                 return true
             }
-            registerTap(code, allowOppositeCombo = false)
+            registerKeyTap(code)
             return true
         }
         return true
     }
 
-    private fun registerTap(code: Int, allowOppositeCombo: Boolean) {
-        val now = SystemClock.elapsedRealtime()
-        if (pendingCode != 0 && pendingCode != code) {
-            if (allowOppositeCombo && (now - pendingTimeMs) <= comboWindowMs) {
-                cancelPending()
-                sendMedia(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-                updateActiveState(screenOffHint = true, forceAudioActive = true)
-                return
-            }
-            flushSingle()
-        }
+    private fun registerKeyTap(code: Int) {
+        if (pendingCode != 0 && pendingCode != code) flushSingle()
+        volumeDrivenPending = false
         pendingCode = code
         pendingCount++
-        pendingTimeMs = now
+        pendingTimeMs = SystemClock.elapsedRealtime()
         handler.removeCallbacks(flushRunnable)
         if (pendingCount >= 2) {
             if (code == KeyEvent.KEYCODE_VOLUME_UP) sendMedia(KeyEvent.KEYCODE_MEDIA_NEXT)
             else sendMedia(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
-            pendingCode = 0; pendingCount = 0; pendingTimeMs = 0L
+            cancelPending()
         } else {
             handler.postDelayed(flushRunnable, doubleTapMs)
         }
@@ -270,23 +303,34 @@ class VolumeKeyService : AccessibilityService() {
     private fun flushSingle() {
         handler.removeCallbacks(flushRunnable)
         if (pendingCode != 0) {
-            val dir = if (pendingCode == KeyEvent.KEYCODE_VOLUME_UP)
-                AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
-            audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, 0)
+            if (volumeDrivenPending) {
+                if (intendedSingleVol >= 0 &&
+                    audio.getStreamVolume(AudioManager.STREAM_MUSIC) != intendedSingleVol
+                ) {
+                    setMusicVolumeSilently(intendedSingleVol)
+                }
+            } else {
+                val dir = if (pendingCode == KeyEvent.KEYCODE_VOLUME_UP)
+                    AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER
+                audio.adjustStreamVolume(AudioManager.STREAM_MUSIC, dir, 0)
+            }
         }
-        pendingCode = 0; pendingCount = 0; pendingTimeMs = 0L
+        cancelPending()
     }
 
     private fun cancelPending() {
         handler.removeCallbacks(flushRunnable)
-        pendingCode = 0; pendingCount = 0; pendingTimeMs = 0L
+        pendingCode = 0
+        pendingCount = 0
+        pendingTimeMs = 0L
+        volumeDrivenPending = false
+        baselineVol = -1
+        intendedSingleVol = -1
     }
 
     private fun sendMedia(keyCode: Int) {
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
         audio.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
-        handler.removeCallbacks(reclaimSessionRunnable)
-        handler.postDelayed(reclaimSessionRunnable, 150L)
     }
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {}
@@ -295,19 +339,20 @@ class VolumeKeyService : AccessibilityService() {
     override fun onDestroy() {
         handler.removeCallbacks(flushRunnable)
         handler.removeCallbacks(stopKeepAliveRunnable)
-        handler.removeCallbacks(reclaimSessionRunnable)
-        try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
+        try { unregisterReceiver(systemReceiver) } catch (_: Exception) {}
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && playbackCallback != null) {
             audio.unregisterAudioPlaybackCallback(playbackCallback)
         }
         stopKeepAlive()
-        mediaSession?.release()
-        mediaSession = null
         super.onDestroy()
     }
 
     companion object {
         private const val CHANNEL_ID = "volume_keys_playback_channel"
         private const val NOTIF_ID = 1001
+        private const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
+        private const val EXTRA_VOLUME_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
+        private const val EXTRA_VOLUME_STREAM_VALUE = "android.media.EXTRA_VOLUME_STREAM_VALUE"
+        private const val EXTRA_PREV_VOLUME_STREAM_VALUE = "android.media.EXTRA_PREV_VOLUME_STREAM_VALUE"
     }
 }
