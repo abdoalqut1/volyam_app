@@ -1,12 +1,7 @@
 name: Build APK
 on:
   push:
-    paths-ignore:
-      - 'debug.keystore'
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -17,11 +12,17 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+      - name: Cache debug keystore
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: volume-keys-debug-keystore-v1
       - name: Setup persistent debug keystore
         run: |
-          if [ ! -f debug.keystore ]; then
+          if [ ! -f ~/.android/debug.keystore ]; then
+            mkdir -p ~/.android
             keytool -genkeypair -v \
-              -keystore debug.keystore \
+              -keystore ~/.android/debug.keystore \
               -storepass android \
               -alias androiddebugkey \
               -keypass android \
@@ -29,14 +30,7 @@ jobs:
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add debug.keystore
-            git commit -m "Add persistent debug keystore"
-            git push || true
           fi
-          mkdir -p ~/.android
-          cp debug.keystore ~/.android/debug.keystore
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
