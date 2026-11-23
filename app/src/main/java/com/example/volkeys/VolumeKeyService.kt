@@ -1,10 +1,14 @@
 package com.example.volkeys
 
 import android.accessibilityservice.AccessibilityService
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.os.Build
@@ -24,6 +28,7 @@ class VolumeKeyService : AccessibilityService() {
     private var comboFired = false
     private var pendingCode = 0
     private var pendingCount = 0
+    private var isForegroundRunning = false
 
     private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
     private val power by lazy { getSystemService(POWER_SERVICE) as PowerManager }
@@ -34,26 +39,28 @@ class VolumeKeyService : AccessibilityService() {
     }
 
     private val flushRunnable = Runnable { flushSingle() }
-    private val releaseWakeLockRunnable = Runnable {
-        if (wakeLock.isHeld) wakeLock.release()
-    }
+    private val stopKeepAliveRunnable = Runnable { stopKeepAlive() }
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            updateWakeLockState()
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> updateActiveState(screenOffHint = true)
+                Intent.ACTION_SCREEN_ON -> updateActiveState(screenOffHint = false)
+            }
         }
     }
 
     private val playbackCallback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
         object : AudioManager.AudioPlaybackCallback() {
             override fun onPlaybackConfigChanged(configs: List<AudioPlaybackConfiguration>) {
-                updateWakeLockState(forceActive = configs.isNotEmpty())
+                updateActiveState(forceAudioActive = configs.isNotEmpty())
             }
         }
     } else null
 
     override fun onServiceConnected() {
         super.onServiceConnected()
+        createNotificationChannel()
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
@@ -66,26 +73,93 @@ class VolumeKeyService : AccessibilityService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && playbackCallback != null) {
             audio.registerAudioPlaybackCallback(playbackCallback, handler)
         }
-        updateWakeLockState()
+        updateActiveState()
     }
 
-    private fun updateWakeLockState(forceActive: Boolean = false) {
-        if (power.isInteractive) {
-            handler.removeCallbacks(releaseWakeLockRunnable)
-            if (wakeLock.isHeld) wakeLock.release()
+    private fun updateActiveState(
+        screenOffHint: Boolean? = null,
+        forceAudioActive: Boolean = false
+    ) {
+        val isScreenOff = screenOffHint ?: !power.isInteractive
+        if (!isScreenOff) {
+            handler.removeCallbacks(stopKeepAliveRunnable)
+            stopKeepAlive()
             return
         }
 
-        val shouldKeepAwake = forceActive || audio.isMusicActive
-        if (shouldKeepAwake) {
-            handler.removeCallbacks(releaseWakeLockRunnable)
-            if (!wakeLock.isHeld) {
-                wakeLock.acquire(4 * 60 * 60 * 1000L)
-            }
+        val isPlaying = forceAudioActive || audio.isMusicActive
+        if (isPlaying) {
+            handler.removeCallbacks(stopKeepAliveRunnable)
+            startKeepAlive()
         } else {
-            handler.removeCallbacks(releaseWakeLockRunnable)
-            handler.postDelayed(releaseWakeLockRunnable, 5000L)
+            handler.removeCallbacks(stopKeepAliveRunnable)
+            handler.postDelayed(stopKeepAliveRunnable, 8000L)
         }
+    }
+
+    private fun startKeepAlive() {
+        if (!wakeLock.isHeld) {
+            wakeLock.acquire(4 * 60 * 60 * 1000L)
+        }
+        if (!isForegroundRunning) {
+            try {
+                val notification = buildNotification()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    startForeground(
+                        NOTIF_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                    )
+                } else {
+                    startForeground(NOTIF_ID, notification)
+                }
+                isForegroundRunning = true
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun stopKeepAlive() {
+        if (isForegroundRunning) {
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Exception) {
+            }
+            isForegroundRunning = false
+        }
+        if (wakeLock.isHeld) {
+            wakeLock.release()
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "التحكم بأزرار الصوت",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply {
+                description = "يعمل فقط أثناء تشغيل الصوت والشاشة مغلقة"
+                setShowBadge(false)
+            }
+            val manager = getSystemService(NotificationManager::class.java)
+            manager?.createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, CHANNEL_ID)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        return builder
+            .setContentTitle("Volume Keys نشط")
+            .setContentText("التحكم في الصوتيات والشاشة مغلقة")
+            .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
+            .setOngoing(true)
+            .build()
     }
 
     override fun onKeyEvent(event: KeyEvent): Boolean {
@@ -100,7 +174,7 @@ class VolumeKeyService : AccessibilityService() {
                 comboFired = true
                 cancelPending()
                 sendMedia(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)
-                updateWakeLockState(forceActive = true)
+                updateActiveState(screenOffHint = true, forceAudioActive = true)
             }
             return true
         } else if (event.action == KeyEvent.ACTION_UP) {
@@ -154,12 +228,17 @@ class VolumeKeyService : AccessibilityService() {
 
     override fun onDestroy() {
         handler.removeCallbacks(flushRunnable)
-        handler.removeCallbacks(releaseWakeLockRunnable)
+        handler.removeCallbacks(stopKeepAliveRunnable)
         try { unregisterReceiver(screenReceiver) } catch (_: Exception) {}
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && playbackCallback != null) {
             audio.unregisterAudioPlaybackCallback(playbackCallback)
         }
-        if (wakeLock.isHeld) wakeLock.release()
+        stopKeepAlive()
         super.onDestroy()
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "volume_keys_playback_channel"
+        private const val NOTIF_ID = 1001
     }
 }
